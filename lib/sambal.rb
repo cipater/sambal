@@ -1,6 +1,6 @@
 # coding: UTF-8
 
-require "sambal/version"
+require 'sambal/version'
 require 'open3'
 require 'logger'
 require 'json'
@@ -10,20 +10,18 @@ require 'time'
 require 'tempfile'
 
 module Sambal
-
   class InternalError < RuntimeError; end
 
   class Response
-
     attr_reader :message
 
     def initialize(message, success)
       msg = message.split("\n")
+
       msg.each do |line|
-        if line =~ /^NT\_.*\s/
-          @message = line
-        end
+        line =~ /^NT\_.*\s/ && @message = line
       end
+
       @message ||= message
       @success = success
     end
@@ -35,43 +33,29 @@ module Sambal
     def failure?
       !success?
     end
-
   end
 
   class Client
-
     attr_reader :connected
 
-    def initialize(options={})
-      begin
-        options = {domain: 'WORKGROUP', host: '127.0.0.1', share: '', user: 'guest', password: '--no-pass', port: 445}.merge(options)
-        @o, @i, @pid = PTY.spawn("smbclient //#{options[:host]}/#{options[:share]} #{options[:password]} -W #{options[:domain]} -U #{options[:user]} -p #{options[:port]}")
-        #@o.set_encoding('UTF-8:UTF-8') ## don't know didn't work, we only have this problem when the files are named using non-english characters
-        #@i.set_encoding('UTF-8:UTF-8')
-        res = @o.expect(/^smb:.*\\>/, 10)[0] rescue nil
-        @connected = case res
-        when nil
-          $stderr.puts "Failed to connect"
-          false
-        when /^put/
-          res['putting'].nil? ? false : true
-        else
-          if res['NT_STATUS']
-            false
-          elsif res['timed out'] || res['Server stopped']
-            false
-          else
-            true
-          end
-        end
+    def initialize(options = {})
+      timeout = options.fetch(:timeout, 10)
+      options = { domain: 'WORKGROUP', host: '127.0.0.1', share: '',
+                  user: 'guest', password: '--no-pass', port: 445 }
+                .merge(options)
 
-        unless @connected
-          close if @pid
-          exit(1)
-        end
-      rescue Exception => e
-        raise RuntimeError.exception("Unknown Process Failed!! (#{$!.to_s}): #{e.message.inspect}\n"+e.backtrace.join("\n"))
-      end
+      @o, @i, @pid = PTY.spawn("smbclient //#{options[:host]}/#{options[:share]} #{options[:password]} -W #{options[:domain]} -U #{options[:user]} -p #{options[:port]}")
+
+      res = @o.expect(/^smb:.*\\>/, timeout) ||
+            fail('smbclient: connection failed or timed out')
+      res = res.shift
+
+      fail('smbclient: timed out') if res['timed out']
+      fail('smbclient: server stopped') if res['Server stopped']
+
+      @connected = true
+    ensure
+      close if @pid && !@connected
     end
 
     def logger
@@ -83,7 +67,7 @@ module Sambal
     end
 
     def file_context(path)
-      if (path_parts = path.split('/')).length>1
+      if (path_parts = path.split('/')).length > 1
         file = path_parts.pop
         subdirs = path_parts.length
         dir = path_parts.join('/')
@@ -91,12 +75,10 @@ module Sambal
       else
         file = path
       end
-      begin
-        yield(file)
-      ensure
-        unless subdirs.nil?
-          subdirs.times { cd '..' }
-        end
+      yield(file)
+    ensure
+      unless subdirs.nil?
+        subdirs.times { cd '..' }
       end
     end
 
@@ -114,18 +96,16 @@ module Sambal
     end
 
     def get(file, output)
-      begin
-        file_context(file) do |file|
-          response = ask_wrapped 'get', [file, output]
-          if response =~ /^getting\sfile.*$/
-            Response.new(response, true)
-          else
-            Response.new(response, false)
-          end
+      file_context(file) do |file|
+        response = ask_wrapped 'get', [file, output]
+        if response =~ /^getting\sfile.*$/
+          Response.new(response, true)
+        else
+          Response.new(response, false)
         end
-      rescue InternalError => e
-        Response.new(e.message, false)
       end
+    rescue InternalError => e
+      Response.new(e.message, false)
     end
 
     def put(file, destination)
@@ -159,74 +139,46 @@ module Sambal
     def rmdir(dir)
       response = cd dir
       return response if response.failure?
-      begin
-        ls.each do |name, meta|
-          if meta[:type]==:file
-            response = del name
-          elsif meta[:type]==:directory && !(name =~ /^\.+$/)
-            response = rmdir(name)
-          end
-          raise InternalError.new response.message if response && response.failure?
+      ls.each do |name, meta|
+        if meta[:type]==:file
+          response = del name
+        elsif meta[:type]==:directory && !(name =~ /^\.+$/)
+          response = rmdir(name)
         end
-        cd '..'
-        response = ask_wrapped 'rmdir', dir
+        raise InternalError.new response.message if response && response.failure?
+      end
+      cd '..'
+      response = ask_wrapped 'rmdir', dir
+      next_line = response.split("\n")[1]
+      if next_line =~ /^smb:.*\\>/
+        Response.new(response, true)
+      else
+        Response.new(response, false)
+      end
+    rescue InternalError => e
+      Response.new(e.message, false)
+    end
+
+    def del(file)
+      file_context(file) do |file|
+        response = ask_wrapped 'del', file
         next_line = response.split("\n")[1]
         if next_line =~ /^smb:.*\\>/
           Response.new(response, true)
         else
           Response.new(response, false)
         end
-      rescue InternalError => e
-        Response.new(e.message, false)
       end
-    end
-
-    def del(file)
-      begin
-        file_context(file) do |file|
-          response = ask_wrapped 'del', file
-          next_line = response.split("\n")[1]
-          if next_line =~ /^smb:.*\\>/
-          Response.new(response, true)
-          #elsif next_line =~ /^NT_STATUS_NO_SUCH_FILE.*$/
-          #  Response.new(response, false)
-          #elsif next_line =~ /^NT_STATUS_ACCESS_DENIED.*$/
-          #  Response.new(response, false)
-          else
-            Response.new(response, false)
-          end
-        end
-      rescue InternalError => e
-        Response.new(e.message, false)
-      end
-      #end
-      #if (path_parts = file.split('/')).length>1
-      #  file = path_parts.pop
-      #  subdirs = path_parts.length
-      #  dir = path_parts.join('/')
-      #  cd dir
-      #end
-    #  response = ask "del #{file}"
-    #  next_line = response.split("\n")[1]
-    #  if next_line =~ /^smb:.*\\>/
-    #    Response.new(response, true)
-    #  #elsif next_line =~ /^NT_STATUS_NO_SUCH_FILE.*$/
-    #  #  Response.new(response, false)
-    #  #elsif next_line =~ /^NT_STATUS_ACCESS_DENIED.*$/
-    #  #  Response.new(response, false)
-    #  else
-    #    Response.new(response, false)
-    #  end
-    #rescue InternalError => e
-    #  Response.new(e.message, false)
-    #ensure
-    #  unless subdirs.nil?
-    #    subdirs.times { cd '..' }
-    #  end
+    rescue InternalError => e
+      Response.new(e.message, false)
     end
 
     def close
       @i.printf("quit\n")
+    rescue IOError
+      # already disconnected
+      false
+    ensure
       @connected = false
     end
 
@@ -276,6 +228,5 @@ module Sambal
       end
       files
     end
-
   end
 end
